@@ -1,0 +1,104 @@
+// =====================================================
+// Pipeline 1 : Build & Smoke sur Pull Request vers dev
+// =====================================================
+
+def saveReports(String status) {
+    sh """
+        mkdir -p reports
+        docker logs ${env.APP} > reports/app.log 2>&1 || true
+        {
+          echo "Pipeline : Build & Smoke (PR)"
+          echo "Job      : ${env.JOB_NAME}"
+          echo "Build    : #${env.BUILD_NUMBER}"
+          echo "Branche  : ${env.BRANCH_NAME}"
+          echo "Commit   : \$(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
+          echo "Image    : ${env.IMAGE}"
+          echo "Statut   : ${status}"
+          echo "Date     : \$(date '+%Y-%m-%d %H:%M:%S')"
+        } > reports/pipeline-report.txt
+    """
+    archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true, fingerprint: true
+}
+
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout()
+        timestamps()
+        timeout(time: 20, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        IMAGE   = "todo-api:${env.BRANCH_NAME.toLowerCase()}-${env.BUILD_NUMBER}"
+        APP     = "todo-${env.BRANCH_NAME.toLowerCase()}-${env.BUILD_NUMBER}"
+        NETWORK = 'devops-net'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                sh '''
+                    mkdir -p reports
+                    docker --version
+                    echo "PR #${CHANGE_ID} : ${CHANGE_BRANCH} -> ${CHANGE_TARGET}"
+                '''
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''#!/bin/bash
+                    set -o pipefail
+                    docker build --build-arg PYTHON_VERSION=3.12 -t "$IMAGE" . 2>&1 | tee reports/build.log
+                '''
+            }
+        }
+
+        stage('Run (Docker)') {
+            steps {
+                sh '''
+                    docker run -d --name "$APP" --network "$NETWORK" "$IMAGE"
+                    docker ps --filter "name=$APP"
+                '''
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh 'bash smoke_test.sh "http://$APP:5000" reports/smoke-results.txt'
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                script { saveReports('PASSED') }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                sh 'docker rm -f "$APP" || true'
+            }
+        }
+    }
+
+    post {
+        failure {
+            script { saveReports('FAILED') }
+        }
+        cleanup {
+            sh 'docker rm -f "$APP" || true'
+            sh 'docker rmi "$IMAGE" || true'
+            cleanWs()
+        }
+    }
+}
