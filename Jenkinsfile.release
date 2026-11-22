@@ -1,0 +1,117 @@
+// =====================================================
+// Pipeline 3 : Build versionne (tag vX.Y.Z)
+// Builds paralleles + archivage de l'image versionnee
+// =====================================================
+
+def buildImage(String py) {
+    sh """#!/bin/bash
+        set -o pipefail
+        docker build --build-arg PYTHON_VERSION=${py} -t todo-api:${env.VERSION}-py${py} . 2>&1 | tee reports/build-py${py}.log
+    """
+}
+
+def saveReports(String status) {
+    sh """
+        mkdir -p reports
+        docker logs ${env.APP} > reports/app.log 2>&1 || true
+        {
+          echo "Pipeline : Build versionne (tag)"
+          echo "Job      : ${env.JOB_NAME}"
+          echo "Build    : #${env.BUILD_NUMBER}"
+          echo "Tag      : ${env.BRANCH_NAME}"
+          echo "Version  : ${env.VERSION}"
+          echo "Commit   : \$(git rev-parse --short HEAD 2>/dev/null || echo n/a)"
+          echo "Images   : todo-api:${env.VERSION} (Python ${env.RUN_PY}), -py3.11, -py3.12, -py3.13"
+          echo "Statut   : ${status}"
+          echo "Date     : \$(date '+%Y-%m-%d %H:%M:%S')"
+        } > reports/pipeline-report.txt
+    """
+    archiveArtifacts artifacts: 'reports/**, dist/**', allowEmptyArchive: true, fingerprint: true
+}
+
+pipeline {
+    agent any
+
+    options {
+        skipDefaultCheckout()
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        VERSION = "${env.BRANCH_NAME.replaceFirst('^v', '')}"
+        APP     = "todo-release-${env.BUILD_NUMBER}"
+        NETWORK = 'devops-net'
+        RUN_PY  = '3.12'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Setup') {
+            steps {
+                sh '''
+                    mkdir -p reports dist
+                    docker --version
+                    echo "Tag : ${BRANCH_NAME} -> version ${VERSION}"
+                    # Verification du format vX.Y.Z
+                    echo "${BRANCH_NAME}" | grep -Eq '^v[0-9]+\\.[0-9]+\\.[0-9]+$' || { echo "Tag invalide (attendu vX.Y.Z)"; exit 1; }
+                '''
+            }
+        }
+
+        stage('Build') {
+            parallel {
+                stage('Python 3.11') { steps { buildImage('3.11') } }
+                stage('Python 3.12') { steps { buildImage('3.12') } }
+                stage('Python 3.13') { steps { buildImage('3.13') } }
+            }
+        }
+
+        stage('Run (Docker)') {
+            steps {
+                sh '''
+                    docker tag "todo-api:$VERSION-py$RUN_PY" "todo-api:$VERSION"
+                    docker run -d --name "$APP" --network "$NETWORK" "todo-api:$VERSION"
+                    docker ps --filter "name=$APP"
+                '''
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh 'bash smoke_test.sh "http://$APP:5000" reports/smoke-results.txt'
+            }
+        }
+
+        stage('Archive Artifacts') {
+            steps {
+                sh 'docker save "todo-api:$VERSION" | gzip > "dist/todo-api-$VERSION.tar.gz"'
+                sh 'ls -lh dist'
+                script { saveReports('PASSED') }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                sh 'docker rm -f "$APP" || true'
+            }
+        }
+    }
+
+    post {
+        failure {
+            script { saveReports('FAILED') }
+        }
+        cleanup {
+            sh 'docker rm -f "$APP" || true'
+            cleanWs()
+        }
+    }
+}
